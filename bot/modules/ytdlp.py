@@ -101,7 +101,7 @@ class YtSelection:
         buttons = ButtonMaker()
         if "entries" in result:
             self._is_playlist = True
-            for i in ["144", "240", "360", "480", "720", "1080", "1440", "2160"]:
+            for i in ["360"]:
                 video_format = f"bv*[height<=?{i}][ext=mp4]+ba[ext=m4a]/b[height<=?{i}]"
                 b_data = f"{i}|mp4"
                 self.formats[b_data] = video_format
