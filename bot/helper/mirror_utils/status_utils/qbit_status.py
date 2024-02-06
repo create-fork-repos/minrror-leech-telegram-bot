@@ -1,6 +1,6 @@
 from asyncio import sleep
 
-from bot import LOGGER, get_client, QbTorrents, qb_listener_lock
+from bot import LOGGER, get_qb_client, QbTorrents, qb_listener_lock
 from bot.helper.ext_utils.bot_utils import sync_to_async
 from bot.helper.ext_utils.status_utils import (
     MirrorStatus,
@@ -11,7 +11,8 @@ from bot.helper.ext_utils.status_utils import (
 
 def get_download(client, tag, old_info=None):
     try:
-        return client.torrents_info(tag=tag)[0]
+        res = client.torrents_info(tag=tag)[0]
+        return res if res else old_info
     except Exception as e:
         LOGGER.error(f"{e}: Qbittorrent, while getting torrent info. Tag: {tag}")
         return old_info
@@ -19,17 +20,17 @@ def get_download(client, tag, old_info=None):
 
 class QbittorrentStatus:
     def __init__(self, listener, seeding=False, queued=False):
-        self.client = get_client()
+        self.client = get_qb_client()
         self.queued = queued
         self.seeding = seeding
         self.listener = listener
-        self._info = get_download(self.client, f"{self.listener.mid}")
+        self._info = None
 
     def _update(self):
         self._info = get_download(self.client, f"{self.listener.mid}", self._info)
 
     def progress(self):
-        return f"{round(self._info.progress*100, 2)}%"
+        return f"{round(self._info.progress * 100, 2)}%"
 
     def processed_bytes(self):
         return get_readable_file_size(self._info.downloaded)
@@ -94,7 +95,7 @@ class QbittorrentStatus:
         return self._info.hash
 
     async def cancel_task(self):
-        self._update()
+        await sync_to_async(self._update)
         await sync_to_async(self.client.torrents_pause, torrent_hashes=self._info.hash)
         if not self.seeding:
             if self.queued:

@@ -1,19 +1,10 @@
-from pyrogram.handlers import MessageHandler
-from pyrogram.filters import command
-from base64 import b64encode
-from re import match as re_match
 from aiofiles.os import path as aiopath
+from base64 import b64encode
+from pyrogram.filters import command
+from pyrogram.handlers import MessageHandler
+from re import match as re_match
 
 from bot import bot, DOWNLOAD_DIR, LOGGER
-from bot.helper.ext_utils.links_utils import (
-    is_url,
-    is_magnet,
-    is_mega_link,
-    is_gdrive_link,
-    is_rclone_path,
-    is_telegram_link,
-    is_gdrive_id,
-)
 from bot.helper.ext_utils.bot_utils import (
     get_content_type,
     new_task,
@@ -22,22 +13,31 @@ from bot.helper.ext_utils.bot_utils import (
     COMMAND_USAGE,
 )
 from bot.helper.ext_utils.exceptions import DirectDownloadLinkException
-from bot.helper.mirror_utils.download_utils.direct_downloader import add_direct_download
+from bot.helper.ext_utils.links_utils import (
+    is_url,
+    is_magnet,
+    is_gdrive_link,
+    is_rclone_path,
+    is_telegram_link,
+    is_gdrive_id,
+)
+from bot.helper.listeners.task_listener import TaskListener
 from bot.helper.mirror_utils.download_utils.aria2_download import add_aria2c_download
-from bot.helper.mirror_utils.download_utils.gd_download import add_gd_download
-from bot.helper.mirror_utils.download_utils.qbit_download import add_qb_torrent
-from bot.helper.mirror_utils.download_utils.mega_download import add_mega_download
-from bot.helper.mirror_utils.download_utils.rclone_download import add_rclone_download
+from bot.helper.mirror_utils.download_utils.direct_downloader import add_direct_download
 from bot.helper.mirror_utils.download_utils.direct_link_generator import (
     direct_link_generator,
 )
+from bot.helper.mirror_utils.download_utils.gd_download import add_gd_download
+from bot.helper.mirror_utils.download_utils.jd_download import add_jd_download
+from bot.helper.mirror_utils.download_utils.qbit_download import add_qb_torrent
+from bot.helper.mirror_utils.download_utils.rclone_download import add_rclone_download
 from bot.helper.mirror_utils.download_utils.telegram_download import (
     TelegramDownloadHelper,
 )
 from bot.helper.telegram_helper.bot_commands import BotCommands
 from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.message_utils import sendMessage, get_tg_link_message
-from bot.helper.listeners.task_listener import TaskListener
+from myjd.exception import MYJDException
 
 
 class Mirror(TaskListener):
@@ -47,6 +47,7 @@ class Mirror(TaskListener):
         message,
         isQbit=False,
         isLeech=False,
+        isJd=False,
         sameDir=None,
         bulk=None,
         multiTag=None,
@@ -56,14 +57,16 @@ class Mirror(TaskListener):
             sameDir = {}
         if bulk is None:
             bulk = []
-        super().__init__(message)
+        self.message = message
         self.client = client
-        self.isQbit = isQbit
-        self.isLeech = isLeech
         self.multiTag = multiTag
         self.options = options
         self.sameDir = sameDir
         self.bulk = bulk
+        super().__init__()
+        self.isQbit = isQbit
+        self.isLeech = isLeech
+        self.isJd = isJd
 
     @new_task
     async def newEvent(self):
@@ -79,6 +82,9 @@ class Mirror(TaskListener):
             "-z": False,
             "-sv": False,
             "-ss": False,
+            "-f": False,
+            "-fd": False,
+            "-fu": False,
             "-i": 0,
             "-sp": 0,
             "link": "",
@@ -90,6 +96,8 @@ class Mirror(TaskListener):
             "-ap": "",
             "-h": "",
             "-t": "",
+            "-ca": "",
+            "-cv": "",
         }
 
         args = arg_parser(input_list[1:], arg_base)
@@ -98,7 +106,7 @@ class Mirror(TaskListener):
         self.seed = args["-d"]
         self.name = args["-n"]
         self.upDest = args["-up"]
-        self.rcf = args["-rcf"]
+        self.rcFlags = args["-rcf"]
         self.link = args["link"]
         self.compress = args["-z"]
         self.extract = args["-e"]
@@ -107,6 +115,11 @@ class Mirror(TaskListener):
         self.splitSize = args["-sp"]
         self.sampleVideo = args["-sv"]
         self.screenShots = args["-ss"]
+        self.forceRun = args["-f"]
+        self.forceDownload = args["-fd"]
+        self.forceUpload = args["-fu"]
+        self.convertAudio = args["-ca"]
+        self.convertVideo = args["-cv"]
 
         headers = args["-h"]
         isBulk = args["-b"]
@@ -118,6 +131,7 @@ class Mirror(TaskListener):
         seed_time = None
         reply_to = None
         file_ = None
+        session = ""
 
         try:
             self.multi = int(args["-i"])
@@ -172,7 +186,7 @@ class Mirror(TaskListener):
                 self.link = reply_to.text.split("\n", 1)[0].strip()
         if is_telegram_link(self.link):
             try:
-                reply_to, self.session = await get_tg_link_message(self.link)
+                reply_to, session = await get_tg_link_message(self.link)
             except Exception as e:
                 await sendMessage(self.message, f"ERROR: {e}")
                 self.removeFromSameDir()
@@ -197,6 +211,7 @@ class Mirror(TaskListener):
                 nextmsg,
                 self.isQbit,
                 self.isLeech,
+                self.isJd,
                 self.sameDir,
                 self.bulk,
                 self.multiTag,
@@ -242,7 +257,7 @@ class Mirror(TaskListener):
             and not is_gdrive_id(self.link)
         ):
             await sendMessage(
-                self.message, "Open this link for usage help!", COMMAND_USAGE["main"]
+                self.message, COMMAND_USAGE["mirror"][0], COMMAND_USAGE["mirror"][1]
             )
             self.removeFromSameDir()
             return
@@ -258,7 +273,7 @@ class Mirror(TaskListener):
             return
 
         if (
-            not is_mega_link(self.link)
+            not self.isJd
             and not self.isQbit
             and not is_magnet(self.link)
             and not is_rclone_path(self.link)
@@ -285,17 +300,22 @@ class Mirror(TaskListener):
                         return
 
         if file_ is not None:
-            await TelegramDownloadHelper(self).add_download(reply_to, f"{path}/")
+            await TelegramDownloadHelper(self).add_download(reply_to, f"{path}/", session)
         elif isinstance(self.link, dict):
             await add_direct_download(self, path)
+        elif self.isJd:
+            try:
+                await add_jd_download(self, path)
+            except (Exception, MYJDException) as e:
+                await sendMessage(self.message, f"{e}".strip())
+                self.removeFromSameDir()
+                return
+        elif self.isQbit:
+            await add_qb_torrent(self, path, ratio, seed_time)
         elif is_rclone_path(self.link):
             await add_rclone_download(self, f"{path}/")
         elif is_gdrive_link(self.link) or is_gdrive_id(self.link):
             await add_gd_download(self, path)
-        elif is_mega_link(self.link):
-            await add_mega_download(self, f"{path}/")
-        elif self.isQbit:
-            await add_qb_torrent(self, path, ratio, seed_time)
         else:
             ussr = args["-au"]
             pssw = args["-ap"]
@@ -305,8 +325,6 @@ class Mirror(TaskListener):
                     f" authorization: Basic {b64encode(auth.encode()).decode('ascii')}"
                 )
             await add_aria2c_download(self, path, headers, ratio, seed_time)
-
-        self.removeFromSameDir()
 
 
 async def mirror(client, message):
@@ -323,6 +341,14 @@ async def leech(client, message):
 
 async def qb_leech(client, message):
     Mirror(client, message, isQbit=True, isLeech=True).newEvent()
+
+
+async def jd_mirror(client, message):
+    Mirror(client, message, isJd=True).newEvent()
+
+
+async def jd_leech(client, message):
+    Mirror(client, message, isLeech=True, isJd=True).newEvent()
 
 
 bot.add_handler(
@@ -344,5 +370,16 @@ bot.add_handler(
 bot.add_handler(
     MessageHandler(
         qb_leech, filters=command(BotCommands.QbLeechCommand) & CustomFilters.authorized
+    )
+)
+bot.add_handler(
+    MessageHandler(
+        jd_mirror,
+        filters=command(BotCommands.JdMirrorCommand) & CustomFilters.authorized,
+    )
+)
+bot.add_handler(
+    MessageHandler(
+        jd_leech, filters=command(BotCommands.JdLeechCommand) & CustomFilters.authorized
     )
 )

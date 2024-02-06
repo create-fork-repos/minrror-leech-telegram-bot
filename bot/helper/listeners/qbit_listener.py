@@ -1,23 +1,24 @@
+from aiofiles.os import remove, path as aiopath
 from asyncio import sleep, gather
 from time import time
 
 from bot import (
     task_dict,
     task_dict_lock,
-    get_client,
-    QbInterval,
+    Intervals,
+    get_qb_client,
     config_dict,
     QbTorrents,
     qb_listener_lock,
     LOGGER,
     bot_loop,
 )
+from bot.helper.ext_utils.bot_utils import new_task, sync_to_async
+from bot.helper.ext_utils.files_utils import clean_unwanted
+from bot.helper.ext_utils.status_utils import get_readable_time, getTaskByGid
+from bot.helper.ext_utils.task_manager import stop_duplicate_check
 from bot.helper.mirror_utils.status_utils.qbit_status import QbittorrentStatus
 from bot.helper.telegram_helper.message_utils import update_status_message
-from bot.helper.ext_utils.bot_utils import new_task, sync_to_async
-from bot.helper.ext_utils.status_utils import get_readable_time, getTaskByGid
-from bot.helper.ext_utils.files_utils import clean_unwanted
-from bot.helper.ext_utils.task_manager import stop_duplicate_check
 
 
 async def _remove_torrent(client, hash_, tag):
@@ -78,8 +79,18 @@ async def _onDownloadComplete(tor):
         await sync_to_async(task.client.torrents_pause, torrent_hashes=ext_hash)
     if task.listener.select:
         await clean_unwanted(task.listener.dir)
+        path = tor.content_path.rsplit("/", 1)[0]
+        res = await sync_to_async(task.client.torrents_files, torrent_hash=ext_hash)
+        for f in res:
+            if f.priority == 0 and await aiopath.exists(f"{path}/{f.name}"):
+                try:
+                    await remove(f"{path}/{f.name}")
+                except:
+                    pass
     await task.listener.onDownloadComplete()
-    client = await sync_to_async(get_client)
+    if Intervals["stopAll"]:
+        return
+    client = await sync_to_async(get_qb_client)
     if task.listener.seed:
         async with task_dict_lock:
             if task.listener.mid in task_dict:
@@ -103,12 +114,12 @@ async def _onDownloadComplete(tor):
 
 
 async def _qb_listener():
-    client = await sync_to_async(get_client)
+    client = await sync_to_async(get_qb_client)
     while True:
         async with qb_listener_lock:
             try:
                 if len(await sync_to_async(client.torrents_info)) == 0:
-                    QbInterval.clear()
+                    Intervals["qb"] = ""
                     await sync_to_async(client.auth_log_out)
                     break
                 for tor_info in await sync_to_async(client.torrents_info):
@@ -184,7 +195,7 @@ async def _qb_listener():
                         await sleep(0.5)
             except Exception as e:
                 LOGGER.error(str(e))
-                client = await sync_to_async(get_client)
+                client = await sync_to_async(get_qb_client)
         await sleep(3)
 
 
@@ -197,6 +208,5 @@ async def onDownloadStart(tag):
             "uploaded": False,
             "seeding": False,
         }
-        if not QbInterval:
-            periodic = bot_loop.create_task(_qb_listener())
-            QbInterval.append(periodic)
+        if not Intervals["qb"]:
+            Intervals["qb"] = bot_loop.create_task(_qb_listener())

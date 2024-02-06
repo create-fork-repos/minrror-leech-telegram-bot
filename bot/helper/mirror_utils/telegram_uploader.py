@@ -1,16 +1,18 @@
-from logging import getLogger
+from PIL import Image
 from aiofiles.os import (
-    remove as aioremove,
+    remove,
     path as aiopath,
-    rename as aiorename,
+    rename,
     makedirs,
 )
-from os import walk, path as ospath
-from time import time
-from PIL import Image
-from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto
-from pyrogram.errors import FloodWait, RPCError
+from aioshutil import copy
 from asyncio import sleep
+from logging import getLogger
+from natsort import natsorted
+from os import walk, path as ospath
+from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import InputMediaVideo, InputMediaDocument, InputMediaPhoto
+from re import match as re_match, sub as re_sub
 from tenacity import (
     retry,
     wait_exponential,
@@ -18,13 +20,11 @@ from tenacity import (
     retry_if_exception_type,
     RetryError,
 )
-from re import match as re_match, sub as re_sub
-from natsort import natsorted
-from aioshutil import copy
+from time import time
 
-from bot import config_dict, GLOBAL_EXTENSION_FILTER, user
-from bot.helper.ext_utils.files_utils import clean_unwanted, is_archive, get_base_name
+from bot import config_dict, user
 from bot.helper.ext_utils.bot_utils import sync_to_async
+from bot.helper.ext_utils.files_utils import clean_unwanted, is_archive, get_base_name
 from bot.helper.ext_utils.media_utils import (
     get_media_info,
     get_document_type,
@@ -46,7 +46,7 @@ class TgUploader:
         self._start_time = time()
         self._total_files = 0
         self._is_cancelled = False
-        self._thumb = self._listener.thumb or f"Thumbnails/{listener.user_id}.jpg"
+        self._thumb = self._listener.thumb or f"Thumbnails/{listener.userId}.jpg"
         self._msgs_dict = {}
         self._corrupted = 0
         self._is_corrupted = False
@@ -67,14 +67,14 @@ class TgUploader:
         self._processed_bytes += chunk_size
 
     async def _user_settings(self):
-        self._media_group = self._listener.user_dict.get("media_group") or (
+        self._media_group = self._listener.userDict.get("media_group") or (
             config_dict["MEDIA_GROUP"]
-            if "media_group" not in self._listener.user_dict
+            if "media_group" not in self._listener.userDict
             else False
         )
-        self._lprefix = self._listener.user_dict.get("lprefix") or (
+        self._lprefix = self._listener.userDict.get("lprefix") or (
             config_dict["LEECH_FILENAME_PREFIX"]
-            if "lprefix" not in self._listener.user_dict
+            if "lprefix" not in self._listener.userDict
             else ""
         )
         if not await aiopath.exists(self._thumb):
@@ -109,11 +109,18 @@ class TgUploader:
             self._sent_msg = await user.get_messages(
                 chat_id=self._listener.message.chat.id, message_ids=self._listener.mid
             )
+            if self._sent_msg is None:
+                self._sent_msg = await user.send_message(
+                    chat_id=self._listener.message.chat.id,
+                    text="Deleted Cmd Message! Don't delete the cmd message again!",
+                    disable_web_page_preview=True,
+                    disable_notification=True,
+                )
         else:
             self._sent_msg = self._listener.message
         return True
 
-    async def _prepare_file(self, file_, dirpath):
+    async def _prepare_file(self, file_, dirpath, delete_file):
         if self._lprefix:
             cap_mono = f"{self._lprefix} <code>{file_}</code>"
             self._lprefix = re_sub("<.*?>", "", self._lprefix)
@@ -121,6 +128,7 @@ class TgUploader:
                 self._listener.seed
                 and not self._listener.newDir
                 and not dirpath.endswith("/splited_files_mltb")
+                and not delete_file
             ):
                 dirpath = f"{dirpath}/copied_mltb"
                 await makedirs(dirpath, exist_ok=True)
@@ -128,7 +136,7 @@ class TgUploader:
                 self._up_path = await copy(self._up_path, new_path)
             else:
                 new_path = ospath.join(dirpath, f"{self._lprefix} {file_}")
-                await aiorename(self._up_path, new_path)
+                await rename(self._up_path, new_path)
                 self._up_path = new_path
         else:
             cap_mono = f"<code>{file_}</code>"
@@ -136,7 +144,7 @@ class TgUploader:
             if is_archive(file_):
                 name = get_base_name(file_)
                 ext = file_.split(name, 1)[1]
-            elif match := re_match(r".+(?=\..+\.0*\d+$)|.+(?=\.part\d+\..+)", file_):
+            elif match := re_match(r".+(?=\..+\.0*\d+$)|.+(?=\.part\d+\..+$)", file_):
                 name = match.group(0)
                 ext = file_.split(name, 1)[1]
             elif len(fsplit := ospath.splitext(file_)) > 1:
@@ -152,6 +160,7 @@ class TgUploader:
                 self._listener.seed
                 and not self._listener.newDir
                 and not dirpath.endswith("/splited_files_mltb")
+                and not delete_file
             ):
                 dirpath = f"{dirpath}/copied_mltb"
                 await makedirs(dirpath, exist_ok=True)
@@ -159,7 +168,7 @@ class TgUploader:
                 self._up_path = await copy(self._up_path, new_path)
             else:
                 new_path = ospath.join(dirpath, f"{name}{ext}")
-                await aiorename(self._up_path, new_path)
+                await rename(self._up_path, new_path)
                 self._up_path = new_path
         return cap_mono
 
@@ -191,14 +200,16 @@ class TgUploader:
                     inputs.append(InputMediaPhoto(m, cap))
                 else:
                     outputs.remove(m)
-            if outputs:
-                self._sent_msg = (await self._sent_msg.reply_media_group(
+        if outputs:
+            self._sent_msg = (
+                await self._sent_msg.reply_media_group(
                     media=inputs,
                     quote=True,
                     disable_notification=True,
-                ))[-1]
-                for m in outputs:
-                    await aioremove(m)
+                )
+            )[-1]
+            for m in outputs:
+                await remove(m)
 
     async def _send_media_group(self, subkey, key, msgs):
         msgs_list = await msgs[0].reply_to_message.reply_media_group(
@@ -216,30 +227,27 @@ class TgUploader:
                 self._msgs_dict[m.link] = m.caption
         self._sent_msg = msgs_list[-1]
 
-    async def upload(self, o_files, m_size, size):
+    async def upload(self, o_files, ft_delete):
         await self._user_settings()
         res = await self._msg_to_reply()
         if not res:
             return
-        if self._listener.user_dict.get("excluded_extensions", False):
-            extension_filter = self._listener.user_dict["excluded_extensions"]
-        elif "excluded_extensions" not in self._listener.user_dict:
-            extension_filter = GLOBAL_EXTENSION_FILTER
-        else:
-            extension_filter = ["aria2", "!qB"]
         for dirpath, _, files in sorted(await sync_to_async(walk, self._path)):
+            delete_file = False
             if dirpath.endswith("/yt-dlp-thumb"):
                 continue
             for file_ in natsorted(files):
                 self._up_path = ospath.join(dirpath, file_)
-                if file_.lower().endswith(tuple(extension_filter)):
+                if self._up_path in ft_delete:
+                    delete_file = True
+                if self._up_path in o_files:
+                    continue
+                if file_.lower().endswith(tuple(self._listener.extensionFilter)):
                     if not self._listener.seed or self._listener.newDir:
-                        await aioremove(self._up_path)
+                        await remove(self._up_path)
                     continue
                 try:
                     f_size = await aiopath.getsize(self._up_path)
-                    if self._listener.seed and file_ in o_files and f_size in m_size:
-                        continue
                     self._total_files += 1
                     if f_size == 0:
                         LOGGER.error(
@@ -249,16 +257,15 @@ class TgUploader:
                         continue
                     if self._is_cancelled:
                         return
-                    cap_mono = await self._prepare_file(file_, dirpath)
+                    cap_mono = await self._prepare_file(file_, dirpath, delete_file)
                     if self._last_msg_in_group:
                         group_lists = [
                             x for v in self._media_dict.values() for x in v.keys()
                         ]
-                        if (
-                            match := re_match(
-                                r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+)", self._up_path
-                            )
-                        ) and match.group(0) not in group_lists:
+                        match = re_match(
+                            r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", self._up_path
+                        )
+                        if not match or match and match.group(0) not in group_lists:
                             for key, value in list(self._media_dict.items()):
                                 for subkey, msgs in list(value.items()):
                                     if len(msgs) > 1:
@@ -293,13 +300,19 @@ class TgUploader:
                             or self._listener.newDir
                             or dirpath.endswith("/splited_files_mltb")
                             or "/copied_mltb/" in self._up_path
+                            or delete_file
                         )
                     ):
-                        await aioremove(self._up_path)
+                        await remove(self._up_path)
         for key, value in list(self._media_dict.items()):
             for subkey, msgs in list(value.items()):
                 if len(msgs) > 1:
-                    await self._send_media_group(subkey, key, msgs)
+                    try:
+                        await self._send_media_group(subkey, key, msgs)
+                    except Exception as e:
+                        LOGGER.info(
+                            f"While sending media group at the end of task. Error: {e}"
+                        )
         if self._is_cancelled:
             return
         if self._listener.seed and not self._listener.newDir:
@@ -316,7 +329,7 @@ class TgUploader:
             return
         LOGGER.info(f"Leech Completed: {self._listener.name}")
         await self._listener.onUploadComplete(
-            None, size, self._msgs_dict, self._total_files, self._corrupted
+            None, self._msgs_dict, self._total_files, self._corrupted
         )
 
     @retry(
@@ -341,13 +354,13 @@ class TgUploader:
                     thumb = await get_audio_thumb(self._up_path)
 
             if (
-                self._listener.as_doc
+                self._listener.asDoc
                 or force_document
                 or (not is_video and not is_audio and not is_image)
             ):
                 key = "documents"
                 if is_video:
-                    if self._listener.screenShots:
+                    if self._listener.screenShots and "SAMPLE." not in file:
                         await self._send_screenshots()
                     if thumb is None:
                         thumb = await create_thumbnail(self._up_path, None)
@@ -364,7 +377,7 @@ class TgUploader:
                     progress=self._upload_progress,
                 )
             elif is_video:
-                if self._listener.screenShots:
+                if self._listener.screenShots and "SAMPLE." not in file:
                     await self._send_screenshots()
                 key = "videos"
                 duration = (await get_media_info(self._up_path))[0]
@@ -376,23 +389,6 @@ class TgUploader:
                 else:
                     width = 480
                     height = 320
-                if not self._up_path.upper().endswith(("MP4", "MKV")):
-                    dirpath, file_ = self._up_path.rsplit("/", 1)
-                    if (
-                        self._listener.seed
-                        and not self._listener.newDir
-                        and not dirpath.endswith("/splited_files_mltb")
-                    ):
-                        dirpath = f"{dirpath}/copied_mltb"
-                        await makedirs(dirpath, exist_ok=True)
-                        new_path = ospath.join(
-                            dirpath, f"{ospath.splitext(file_)[0]}.mp4"
-                        )
-                        self._up_path = await copy(self._up_path, new_path)
-                    else:
-                        new_path = f"{ospath.splitext(self._up_path)[0]}.mp4"
-                        await aiorename(self._up_path, new_path)
-                        self._up_path = new_path
                 if self._is_cancelled:
                     return
                 self._sent_msg = await self._sent_msg.reply_video(
@@ -442,7 +438,7 @@ class TgUploader:
             ):
                 key = "documents" if self._sent_msg.document else "videos"
                 if match := re_match(
-                    r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+)", self._up_path
+                    r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", self._up_path
                 ):
                     pname = match.group(0)
                     if pname in self._media_dict[key].keys():
@@ -460,7 +456,7 @@ class TgUploader:
                 and thumb is not None
                 and await aiopath.exists(thumb)
             ):
-                await aioremove(thumb)
+                await remove(thumb)
         except FloodWait as f:
             LOGGER.warning(str(f))
             await sleep(f.value)
@@ -470,7 +466,7 @@ class TgUploader:
                 and thumb is not None
                 and await aiopath.exists(thumb)
             ):
-                await aioremove(thumb)
+                await remove(thumb)
             err_type = "RPCError: " if isinstance(err, RPCError) else ""
             LOGGER.error(f"{err_type}{err}. Path: {self._up_path}")
             if "Telegram says: [400" in str(err) and key != "documents":
