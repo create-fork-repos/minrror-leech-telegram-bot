@@ -29,9 +29,9 @@ async def shell(_, message):
             out_file.name = "shell_output.txt"
             await sendFile(message, out_file)
     elif len(reply) != 0:
-        await sendMessage(message, reply)
+        await sendMessage(message, f"{cmd} - {reply}")
     else:
-        await sendMessage(message, "No Reply")
+        await sendMessage(message, f"{cmd} - success")
 
 
 bot.add_handler(
